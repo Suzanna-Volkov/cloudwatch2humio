@@ -1,82 +1,94 @@
 import boto3
-import gzip
 import json
 import os
 import helpers
 from time import sleep
 
-# setup log client
-log_client = boto3.client("logs")
-
-# env vars
+# Set environment variables.
 humio_log_ingester_arn = os.environ["humio_log_ingester_arn"]
 humio_subscription_prefix = os.environ.get("humio_subscription_prefix")
 
-# long running function that lists all log groups and subscribes to them
-def lambda_handler(event, context):
+# Set up CloudWatch Logs client.
+log_client = boto3.client("logs")
 
-    # grab all log groups with a token if we have it
+
+def lambda_handler(event, context):
+    """
+    Back-filler function that lists all log groups and subscribes to them.
+
+    :param event: Event data from CloudWatch Logs.
+    :type event: dict
+
+    :param context: Lambda object context.
+    :type context: obj
+
+    :return: None
+    :rtype: NoneType
+    """
+    # Grab all log groups with a token and/or prefix if we have them.
     if "nextToken" in event.keys():
-        nextToken = event["nextToken"]
+        next_token = event["nextToken"]
         if humio_subscription_prefix:
             log_groups = log_client.describe_log_groups(
-                logGroupNamePrefix=humio_subscription_prefix, nextToken=nextToken
+                logGroupNamePrefix=humio_subscription_prefix,
+                nextToken=next_token
             )
         else:
-            log_groups = log_client.describe_log_groups(nextToken=nextToken)
+            log_groups = log_client.describe_log_groups(
+                nextToken=next_token
+            )
     else:
         if humio_subscription_prefix:
             log_groups = log_client.describe_log_groups(
-                logGroupNamePrefix=humio_subscription_prefix
+                logGroupNamePrefix=humio_subscription_prefix,
             )
         else:
             log_groups = log_client.describe_log_groups()
 
-    # if we have a token, recursively fire another instance of backfiller with it
+    # If we have a next token, recursively fire another instance of backfiller with it.
+    # This is to look through all events.
     if "nextToken" in log_groups.keys():
-        lambda_cli = boto3.client("lambda")
+        lambda_client = boto3.client("lambda")
         event["nextToken"] = log_groups["nextToken"]
-        lambda_cli.invoke_async(
-            FunctionName=context.function_name, InvokeArgs=json.dumps(event)
+        lambda_client.invoke(
+            FunctionName=context.function_name,
+            InvocationType="Event",
+            Payload=json.dumps(event)
         )
 
-    # loop through log groups
-    for logGroup in log_groups["logGroups"]:
-
-        # grab all subscriptions for the specified log group
+    # Loop through log groups.
+    for log_group in log_groups["logGroups"]:
+        # Grab all subscriptions for the specified log group.
         all_subscription_filters = log_client.describe_subscription_filters(
-            logGroupName=logGroup["logGroupName"]
+            logGroupName=log_group["logGroupName"]
         )
 
-        # first we check to see if there are any filters at all
+        # First we check to see if there are any filters at all.
         if all_subscription_filters["subscriptionFilters"]:
-
-            # if our function is not subscribed delete subscription and create ours
-            if (
-                all_subscription_filters["subscriptionFilters"][0]["destinationArn"]
-                != humio_log_ingester_arn
-            ):
+            # If our function is not subscribed, delete subscription and create ours.
+            if all_subscription_filters["subscriptionFilters"][0]["destinationArn"] != humio_log_ingester_arn:
                 helpers.delete_subscription(
                     log_client,
-                    logGroup["logGroupName"],
-                    all_subscription_filters["subscriptionFilters"][0]["filterName"],
+                    log_group["logGroupName"],
+                    all_subscription_filters["subscriptionFilters"][0]["filterName"]
                 )
                 helpers.create_subscription(
                     log_client,
-                    logGroup["logGroupName"],
+                    log_group["logGroupName"],
                     humio_log_ingester_arn,
-                    context,
+                    context
                 )
-
-            # we are subbed
+            # We are now subscribed.
             else:
-                print("We are subscribed to %s" % logGroup["logGroupName"])
-
-        # there are no filters, lets subscribe!
+                print("We are already subscribed to %s" % log_group["logGroupName"])
+        # When there are no subscription filters, let us subscribe!
         else:
             helpers.create_subscription(
-                log_client, logGroup["logGroupName"], humio_log_ingester_arn, context
+                log_client,
+                log_group["logGroupName"],
+                humio_log_ingester_arn, context
             )
 
-        # keep hitting rate limits? TODO: find actual limits and back off using those
+        # Keep hitting rate limits?
+        # TODO: Find actual limits and back off using those.
         sleep(0.8)
